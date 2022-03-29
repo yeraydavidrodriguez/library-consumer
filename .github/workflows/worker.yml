@@ -1,0 +1,138 @@
+name: Worker
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0,10,20,30,40,50 * * * *"
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          submodules: "true"
+
+      - name: Import GPG key
+        id: import-gpg
+        uses: crazy-max/ghaction-import-gpg@v4
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+          git_config_global: true
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          fingerprint: "735F4C82C21549D6BBE6F64941EEAEC608A47F38"
+
+      - name: Get next job
+        id: get-next-job
+        uses: Nautilus-Cyberneering/git-queue@issue-24-add-json-metadata-commit-body
+        with:
+          queue_name: "libraryaaa"
+          action: "next-job"
+
+      - name: Parse job payload
+        id: parse-payload
+        if: ${{ steps.get-next-job.outputs.job_found == 'true' }}
+        shell: bash
+        run: |
+          PAYLOAD="${{ steps.get-next-job.outputs.job_payload }}" ./scripts/parse-payload.sh          
+
+      - name: Build job started message payload
+        id: build-start-payload
+        if: ${{ steps.get-next-job.outputs.job_found == 'true' }}
+        shell: bash
+        run: |
+          PAYLOAD="Successfully started job according to specification in commit:
+          https://github.com/josecelano/library-consumer/commit/${{ steps.get-next-job.outputs.job_commit }}"
+          PAYLOAD="${PAYLOAD//'%'/'%25'}"
+          PAYLOAD="${PAYLOAD//$'\n'/'%0A'}"
+          PAYLOAD="${PAYLOAD//$'\r'/'%0D'}"
+          echo "::set-output name=payload::$(echo "$PAYLOAD")"
+
+      - name: Mark job as started
+        id: start-job
+        if: ${{ steps.get-next-job.outputs.job_found == 'true' }}
+        uses: Nautilus-Cyberneering/git-queue@issue-24-add-json-metadata-commit-body
+        with:
+          queue_name: "libraryaaa"
+          action: "start-job"
+          job_payload: ${{ steps.build-start-payload.outputs.payload }}          
+
+        # Begin mutual exclusion job
+
+      - name: Update submodule
+        id: update-submodule
+        if: ${{ steps.get-next-job.outputs.job_found == 'true' }}
+        shell: bash
+        run: |
+          cd libraries/aaa
+          git fetch --all
+          git checkout ${{ steps.parse-payload.outputs.current_ref }} && echo "::set-output name=updated::true"
+
+      - name: Commit submodule update
+        id: commit-submodule-update
+        if: ${{ steps.get-next-job.outputs.job_found == 'true' }}
+        shell: bash
+        run: |
+          git add libraries/aaa
+          git commit -m "update library aaa to commit ${{ steps.parse-payload.outputs.current_ref }}"
+
+      - name: Sync files from library
+        if: ${{ steps.get-next-job.outputs.job_found == 'true' }}
+        id: copy-library
+        run: |
+          rsync -a --delete --include="*/" --include="*.txt" --exclude="*" ./libraries/aaa/data/ ./libraries_mirror/aaa
+
+      - name: Apply changes with a single commit
+        if: ${{ steps.get-next-job.outputs.job_found == 'true' }}
+        run: |
+          git add libraries_mirror/aaa
+          # commit only if there are changes
+          git diff-index --quiet HEAD || git commit -m "library aaa synced to commit ${{ steps.parse-payload.outputs.current_ref }}"
+
+        # End mutual exclusion job
+
+      - name: Build job finished message payload
+        id: build-finish-payload
+        if: ${{ steps.start-job.outputs.job_started == 'true' }}
+        shell: bash
+        run: |
+          PAYLOAD="Successfully finished job according to specification in commit:
+          https://github.com/josecelano/library-consumer/commit/${{ steps.get-next-job.outputs.job_commit }}"
+          PAYLOAD="${PAYLOAD//'%'/'%25'}"
+          PAYLOAD="${PAYLOAD//$'\n'/'%0A'}"
+          PAYLOAD="${PAYLOAD//$'\r'/'%0D'}"
+          echo "::set-output name=payload::$(echo "$PAYLOAD")"
+
+      - name: Mark job as finished
+        id: finish-job
+        if: ${{ steps.start-job.outputs.job_started == 'true' }}
+        uses: Nautilus-Cyberneering/git-queue@v1-beta
+        with:
+          queue_name: "Library Update [library-aaa]"
+          action: "finish-job"
+          job_payload: ${{ steps.build-finish-payload.outputs.payload }}
+
+      - name: Debug step outputs
+        if: ${{ steps.get-next-job.outputs.job_found == 'true' }}
+        run: |
+          echo -e "previous_ref: ${{ steps.parse-payload.outputs.previous_ref }}"
+          echo -e "current_ref: ${{ steps.parse-payload.outputs.current_ref }}"
+          echo -e "updated: ${{ steps.update-submodule.outputs.updated }}"
+          echo -e "start payload:\n${{ steps.build-start-payload.outputs.payload }}"
+          echo -e "finish payload:\n${{ steps.build-finish-payload.outputs.payload }}"
+
+      - name: Show new commits
+        run: |
+          git log --pretty="fuller" --show-signature -5        
+
+      - name: Push
+        id: push
+        if: ${{ steps.get-next-job.outputs.job_found == 'true' }}
+        shell: bash
+        run: |
+          git push
